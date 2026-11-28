@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using Brutal.VulkanApi;
+using HarmonyLib;
+using RimUnity.Diagnostics;
 using RimWorldWaylith.Rendering;
 using Verse;
 using Waylith;
@@ -15,11 +18,39 @@ public static class RenderPipelineManager
 {
     private static readonly List<FeatureRegistration> s_registrations = new();
     private static readonly HashSet<ScriptableRendererFeature> s_retiringFeatures = new(ReferenceEqualityComparer.Instance);
-    private static readonly List<Action> s_pendingAfterSubmit = new();
-    private static readonly object s_submitLock = new();
+    [ThreadStatic] private static List<Action> s_pendingAfterSubmit;
     private static readonly Action<Action> s_enqueueAfterSubmit = _EnqueueAfterSubmit;
     private static EngineApplication s_application;
-    private static bool s_frameEndedSubscribed;
+
+    [HarmonyPatch]
+    private static class RenderFramePatch
+    {
+        internal static readonly MethodInfo Target = AccessTools.DeclaredMethod(
+            typeof(RenderThread), "RenderFrame", new[] { typeof(RenderFrame) });
+
+        private static bool Prepare()
+        {
+            if (Target?.ReturnType == typeof(bool))
+            {
+                return true;
+            }
+            Log.Warning("[RimUnity.RenderPipeline] 找不到 Waylith.RenderThread.RenderFrame(RenderFrame) 的提交结果，已停用提交后回调。");
+            return false;
+        }
+
+        private static MethodBase TargetMethod() => Target;
+
+        private static void Prefix(out ParticleSpikeCapture.MeasureScope __state)
+            => __state = ParticleSpikeCapture.Measure("Host.RenderFrame");
+
+        //宿主返回 true 时已提交并保留该帧；失败时清空当前帧的回调。
+        private static void Finalizer(bool __result, Exception __exception, FrameRenderer ____frameRenderer,
+            ParticleSpikeCapture.MeasureScope __state)
+        {
+            __state.End(__exception);
+            _FinishSubmission(__result && __exception == null, ____frameRenderer);
+        }
+    }
 
     private sealed class FeatureRegistration
     {
@@ -251,7 +282,6 @@ public static class RenderPipelineManager
         FrameRenderer renderer = s_application?.FrameRenderer;
         if (renderer != null)
         {
-            _EnsureFrameEndedSubscribed(renderer);
             //先完成 Create、AddRenderPasses、阶段校验和宿主挂载再入表；失败时清理本次状态，避免阻塞后续扩展注册。
             _AttachRegistration(registration, renderer);
         }
@@ -296,11 +326,7 @@ public static class RenderPipelineManager
         {
             return;
         }
-        if (!ReferenceEquals(s_application, application))
-        {
-            s_application = application;
-            s_frameEndedSubscribed = false;
-        }
+        s_application = application;
         _AttachPendingRegistrations();
     }
 
@@ -308,10 +334,6 @@ public static class RenderPipelineManager
     internal static void Shutdown()
     {
         FrameRenderer renderer = s_application?.FrameRenderer;
-        if (renderer != null && s_frameEndedSubscribed)
-        {
-            renderer.RenderThreadFrameEnded -= _OnRenderThreadFrameEnded;
-        }
         for (int index = s_registrations.Count - 1; index >= 0; index--)
         {
             FeatureRegistration registration = s_registrations[index];
@@ -332,21 +354,7 @@ public static class RenderPipelineManager
         }
         s_registrations.Clear();
         s_retiringFeatures.Clear();
-        s_frameEndedSubscribed = false;
-        lock (s_submitLock)
-        {
-            s_pendingAfterSubmit.Clear();
-        }
         s_application = null;
-    }
-
-    private static void _EnsureFrameEndedSubscribed(FrameRenderer renderer)
-    {
-        if (!s_frameEndedSubscribed)
-        {
-            renderer.RenderThreadFrameEnded += _OnRenderThreadFrameEnded;
-            s_frameEndedSubscribed = true;
-        }
     }
 
     //安装时逐个挂载预注册扩展；单个扩展失败只移除自身并记错，不阻塞其他正常扩展。
@@ -357,7 +365,6 @@ public static class RenderPipelineManager
         {
             return;
         }
-        _EnsureFrameEndedSubscribed(renderer);
         FeatureRegistration[] pending = s_registrations.ToArray();
         for (int index = 0; index < pending.Length; index++)
         {
@@ -560,32 +567,27 @@ public static class RenderPipelineManager
 
     private static void _EnqueueAfterSubmit(Action callback)
     {
-        lock (s_submitLock)
+        if (RenderFramePatch.Target?.ReturnType != typeof(bool))
         {
-            s_pendingAfterSubmit.Add(callback);
+            throw new NotSupportedException("当前 Waylith 版本不支持提交后回调。");
         }
+        (s_pendingAfterSubmit ??= new List<Action>()).Add(callback);
     }
 
-    private static void _OnRenderThreadFrameEnded(RenderFrame _)
+    private static void _FinishSubmission(bool submitted, FrameRenderer renderer)
     {
-        FrameRenderer renderer = s_application?.FrameRenderer;
-        Action[] callbackBatch;
-        lock (s_submitLock)
-        {
-            if (s_pendingAfterSubmit.Count == 0)
-            {
-                return;
-            }
-            callbackBatch = s_pendingAfterSubmit.ToArray();
-            s_pendingAfterSubmit.Clear();
-        }
-        if (renderer == null)
+        List<Action> callbacks = s_pendingAfterSubmit;
+        if (callbacks == null || callbacks.Count == 0)
         {
             return;
         }
-        for (int index = 0; index < callbackBatch.Length; index++)
+        if (submitted)
         {
-            renderer.RenderToMainThread.Enqueue(callbackBatch[index]);
+            for (int index = 0; index < callbacks.Count; index++)
+            {
+                renderer.RenderToMainThread.Enqueue(callbacks[index]);
+            }
         }
+        callbacks.Clear();
     }
 }
